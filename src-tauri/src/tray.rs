@@ -456,11 +456,23 @@ pub fn tray_tooltip() -> String {
     version_label()
 }
 
+/// The configured product name (tauri `productName`), so builds that
+/// override it (e.g. a side-by-side local build) are told apart in the tray.
+static PRODUCT_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_product_name(name: &str) {
+    let _ = PRODUCT_NAME.set(name.to_string());
+}
+
+pub fn product_name() -> &'static str {
+    PRODUCT_NAME.get().map(String::as_str).unwrap_or("Handy")
+}
+
 fn version_label() -> String {
     if cfg!(debug_assertions) {
-        format!("Handy v{} (Dev)", env!("CARGO_PKG_VERSION"))
+        format!("{} v{} (Dev)", product_name(), env!("CARGO_PKG_VERSION"))
     } else {
-        format!("Handy v{}", env!("CARGO_PKG_VERSION"))
+        format!("{} v{}", product_name(), env!("CARGO_PKG_VERSION"))
     }
 }
 

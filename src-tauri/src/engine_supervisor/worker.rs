@@ -15,8 +15,10 @@ use std::io::{self, BufReader, Write};
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 use transcribe_cpp::{
-    Backend, BackendMask, DeviceType, Feature, Model, ModelOptions, Session, Stream,
+    Backend, BackendMask, DeviceType, Feature, Model, ModelOptions, RunOptions, Session, Stream,
+    StreamOptions,
 };
 
 /// Prefix on worker log lines so the parent can tell them apart from raw
@@ -104,7 +106,10 @@ pub fn run() -> i32 {
                 // Free any previous model first to avoid holding two at once.
                 session = None;
                 match load(&path, backend, device) {
-                    Ok(loaded) => {
+                    Ok(mut loaded) => {
+                        if loaded.1.on_gpu {
+                            warm_up(&mut loaded.0, &loaded.1);
+                        }
                         let info = loaded.1.clone();
                         session = Some(loaded);
                         Response::Loaded(info)
@@ -246,6 +251,102 @@ fn serve_stream(
         }
     }
     Ok(())
+}
+
+/// `0`/`off` skips the GPU warm-up after a model load; a comma-separated
+/// list of seconds (e.g. `1,5.12,10`) replaces the default clip lengths.
+const WARMUP_ENV: &str = "HANDY_GPU_WARMUP";
+
+/// Silent clip lengths (seconds) run once right after a GPU model load.
+/// GPU backends (ggml-vulkan in particular) build compute pipelines lazily,
+/// per shape class, on the first graph that needs them. With a cold driver
+/// shader cache (new build, driver update) that took 1.5-3.1 s on the first
+/// ~1 s clip and 0.6-0.9 s more on the first ~5 s clip (Radeon 8060S,
+/// parakeet/cohere Q8_0), and would otherwise land on the user's first
+/// dictations. Longer clips (10-40 s) built nothing new.
+const WARMUP_SECS: &[f32] = &[1.0, 5.12];
+
+/// No new warm-up run starts after this much time: the load already
+/// overlaps the user's speech, but a slow GPU must not hold the first
+/// result back much longer. With a warm driver cache the default clips take
+/// ~0.2-0.4 s; with a cold one they took up to 2.6 s, time the first
+/// dictations would otherwise pay. The 1 s and 5.12 s clips build different
+/// pipelines, so the budget must let both run on a cold cache.
+const WARMUP_BUDGET: Duration = Duration::from_millis(4000);
+
+/// The clip lengths to warm up with, or `None` when disabled.
+fn warmup_lengths() -> Option<Vec<f32>> {
+    parse_warmup_lengths(std::env::var(WARMUP_ENV).ok().as_deref())
+}
+
+fn parse_warmup_lengths(value: Option<&str>) -> Option<Vec<f32>> {
+    let Some(value) = value else {
+        return Some(WARMUP_SECS.to_vec());
+    };
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "0" | "off" | "false" | "no" => None,
+        "" | "1" | "on" | "true" | "yes" => Some(WARMUP_SECS.to_vec()),
+        list => {
+            let secs: Vec<f32> = list
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f32>().ok())
+                .filter(|s| *s > 0.0 && *s <= 60.0)
+                .collect();
+            Some(if secs.is_empty() {
+                WARMUP_SECS.to_vec()
+            } else {
+                secs
+            })
+        }
+    }
+}
+
+/// Runs silent clips (and a short stream on streaming models) through the
+/// freshly loaded session so the GPU's one-off pipeline builds happen during
+/// the load, not the first transcription. Best-effort: any failure only logs.
+fn warm_up(session: &mut Session, info: &LoadedInfo) {
+    let Some(lengths) = warmup_lengths() else {
+        log::info!("GPU warm-up skipped ({WARMUP_ENV})");
+        return;
+    };
+    let started = Instant::now();
+    let options = RunOptions::default();
+    let mut runs = 0;
+    for secs in lengths {
+        if started.elapsed() >= WARMUP_BUDGET {
+            break;
+        }
+        let pcm = vec![0.0f32; (secs * 16_000.0) as usize];
+        let t = Instant::now();
+        if let Err(e) = session.run(&pcm, &options) {
+            warn!("GPU warm-up run ({secs}s) failed: {e}");
+            return;
+        }
+        runs += 1;
+        debug!("GPU warm-up {secs}s took {} ms", t.elapsed().as_millis());
+    }
+    if info.capabilities.supports_streaming && started.elapsed() < WARMUP_BUDGET {
+        let t = Instant::now();
+        match session.stream(&options, &StreamOptions::default()) {
+            Ok(mut stream) => {
+                let pcm = vec![0.0f32; 16_000];
+                let result = stream
+                    .feed(&pcm)
+                    .and_then(|_| stream.feed(&pcm))
+                    .and_then(|_| stream.finalize());
+                if let Err(e) = result {
+                    warn!("GPU warm-up stream failed: {e}");
+                }
+                debug!("GPU warm-up stream took {} ms", t.elapsed().as_millis());
+            }
+            Err(e) => warn!("GPU warm-up stream could not start: {e}"),
+        }
+    }
+    log::info!(
+        "GPU warm-up: {runs} run(s) in {} ms",
+        started.elapsed().as_millis()
+    );
 }
 
 fn not_loaded() -> Response {
@@ -475,5 +576,32 @@ fn take_stdout_for_protocol() -> io::Result<File> {
             return Err(io::Error::last_os_error());
         }
         Ok(File::from_raw_handle(handle as _))
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::{parse_warmup_lengths, WARMUP_SECS};
+
+    #[test]
+    fn default_when_unset_or_on() {
+        assert_eq!(parse_warmup_lengths(None), Some(WARMUP_SECS.to_vec()));
+        assert_eq!(parse_warmup_lengths(Some("on")), Some(WARMUP_SECS.to_vec()));
+        assert_eq!(parse_warmup_lengths(Some("")), Some(WARMUP_SECS.to_vec()));
+    }
+
+    #[test]
+    fn disabled() {
+        assert_eq!(parse_warmup_lengths(Some("0")), None);
+        assert_eq!(parse_warmup_lengths(Some(" OFF ")), None);
+    }
+
+    #[test]
+    fn custom_list_drops_invalid_entries() {
+        assert_eq!(
+            parse_warmup_lengths(Some("1, 5.12,x,-3,99,10")),
+            Some(vec![1.0, 5.12, 10.0])
+        );
+        assert_eq!(parse_warmup_lengths(Some("x")), Some(WARMUP_SECS.to_vec()));
     }
 }
