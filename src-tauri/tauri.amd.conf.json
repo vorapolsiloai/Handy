@@ -1,0 +1,16 @@
+{
+  "productName": "Handy AMD (GPU)",
+  "identifier": "com.pais.handy.amd",
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "targets": ["nsis"],
+    "windows": {
+      "signCommand": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://localhost.invalid/handy-amd/latest.json"]
+    }
+  }
+}
